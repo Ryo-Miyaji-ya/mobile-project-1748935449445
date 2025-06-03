@@ -1,0 +1,244 @@
+name: Claude Code Generator
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_type:
+        description: 'Project type (webapp, api, mobile, cli, library, bot)'
+        required: true
+        type: string
+      tech_stack:
+        description: 'Technology stack'
+        required: true
+        type: string
+      requirements:
+        description: 'Project requirements'
+        required: true
+        type: string
+      slack_channel:
+        description: 'Slack channel for notifications'
+        required: true
+        type: string
+      slack_user:
+        description: 'Slack user who requested'
+        required: true
+        type: string
+
+jobs:
+  generate-project:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Create project structure
+        run: |
+          echo "Creating project structure for ${{ github.event.inputs.project_type }}..."
+          
+          # プロジェクトタイプ別の初期化
+          case "${{ github.event.inputs.tech_stack }}" in
+            "react")
+              npx create-react-app . --template typescript
+              ;;
+            "vue")
+              npm create vue@latest . -- --typescript --router --pinia
+              ;;
+            "node")
+              npm init -y
+              npm install express typescript @types/node @types/express
+              mkdir src
+              ;;
+            "python")
+              pip install fastapi uvicorn
+              mkdir app
+              echo "from fastapi import FastAPI
+app = FastAPI()" > app/main.py
+              ;;
+            *)
+              echo "Creating basic project structure..."
+              npm init -y
+              ;;
+          esac
+
+      - name: Generate project with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Claude APIを使用してプロジェクトファイルを生成
+          cat > generate_project.py << 'EOF'
+          import os
+          import json
+          import requests
+          import base64
+          
+          # プロジェクト情報
+          project_type = "${{ github.event.inputs.project_type }}"
+          tech_stack = "${{ github.event.inputs.tech_stack }}"
+          requirements = "${{ github.event.inputs.requirements }}"
+          
+          # Claude APIリクエスト
+          headers = {
+              "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+              "content-type": "application/json",
+              "anthropic-version": "2023-06-01"
+          }
+          
+          prompt = f"""
+          新しい{project_type}プロジェクトを作成してください。
+          
+          プロジェクト情報:
+          - タイプ: {project_type}
+          - 技術スタック: {tech_stack}
+          - 要件: {requirements}
+          
+          以下を実装してください:
+          1. 適切なプロジェクト構造
+          2. 基本的な設定ファイル
+          3. エントリーポイントとサンプルコード
+          4. README.mdファイル
+          5. 要件に応じた基本機能
+          
+          レスポンスは以下のJSON形式で返してください:
+          {{
+            "files": [
+              {{
+                "path": "ファイルパス",
+                "content": "ファイル内容"
+              }}
+            ],
+            "summary": "実装内容の説明"
+          }}
+          """
+          
+          data = {
+              "model": "claude-3-sonnet-20240229",
+              "max_tokens": 4000,
+              "messages": [
+                  {"role": "user", "content": prompt}
+              ]
+          }
+          
+          response = requests.post(
+              "https://api.anthropic.com/v1/messages",
+              headers=headers,
+              json=data
+          )
+          
+          if response.status_code == 200:
+              result = response.json()
+              content = result["content"][0]["text"]
+              
+              # JSONレスポンスをパース
+              try:
+                  import re
+                  json_match = re.search(r'{.*}', content, re.DOTALL)
+                  if json_match:
+                      project_data = json.loads(json_match.group())
+                      
+                      # ファイルを作成
+                      for file_info in project_data.get("files", []):
+                          file_path = file_info["path"]
+                          file_content = file_info["content"]
+                          
+                          # ディレクトリを作成
+                          os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
+                          
+                          # ファイルを書き込み
+                          with open(file_path, "w", encoding="utf-8") as f:
+                              f.write(file_content)
+                      
+                      print(f"Generated {len(project_data.get('files', []))} files")
+                      print(f"Summary: {project_data.get('summary', 'Project generated successfully')}")
+                      
+                      # サマリーをファイルに保存
+                      with open("generation_summary.txt", "w") as f:
+                          f.write(project_data.get('summary', 'Project generated successfully'))
+              except Exception as e:
+                  print(f"Error parsing response: {e}")
+                  print(f"Raw response: {content}")
+          else:
+              print(f"API Error: {response.status_code} - {response.text}")
+          EOF
+          
+          python generate_project.py
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .
+          git commit -m "feat: initialize ${{ github.event.inputs.project_type }} project with ${{ github.event.inputs.tech_stack }}"
+          git push origin main
+
+      - name: Create Pull Request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # developブランチを作成してPR作成
+          git checkout -b develop
+          git push origin develop
+          
+          # PRの説明を準備
+          SUMMARY="$(cat generation_summary.txt 2>/dev/null || echo 'Project generated successfully')"
+          
+          gh pr create             --title "🚀 Initial project setup: ${{ github.event.inputs.project_type }}"             --body "## 🎉 プロジェクト初期化完了
+          
+          **プロジェクトタイプ**: ${{ github.event.inputs.project_type }}
+          **技術スタック**: ${{ github.event.inputs.tech_stack }}
+          **要求者**: <@${{ github.event.inputs.slack_user }}>
+          
+          ### 📋 要件
+          ${{ github.event.inputs.requirements }}
+          
+          ### 🏗️ 実装内容
+          $SUMMARY
+          
+          ---
+          *このプロジェクトはClaude APIによって自動生成されました。*"             --base main
+
+      - name: Notify Slack on Success
+        if: success()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          SUMMARY="$(cat generation_summary.txt 2>/dev/null || echo 'Project generated successfully')"
+          PR_URL="$(gh pr view develop --json url --jq .url)"
+          
+          curl -X POST "$SLACK_WEBHOOK_URL"             -H 'Content-type: application/json'             --data "{
+              "channel": "${{ github.event.inputs.slack_channel }}",
+              "text": "🎉 プロジェクトの初期化が完了しました!",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  {"title": "プロジェクト名", "value": "${{ github.repository }}", "short": true},
+                  {"title": "タイプ", "value": "${{ github.event.inputs.project_type }}", "short": true},
+                  {"title": "技術スタック", "value": "${{ github.event.inputs.tech_stack }}", "short": true},
+                  {"title": "実装内容", "value": "$SUMMARY", "short": false}
+                ],
+                "actions": [
+                  {"type": "button", "text": "PRを確認", "url": "$PR_URL"}
+                ]
+              }]
+            }"
+
+      - name: Notify Slack on Failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST "$SLACK_WEBHOOK_URL"             -H 'Content-type: application/json'             --data "{
+              "channel": "${{ github.event.inputs.slack_channel }}",
+              "text": "❌ プロジェクト生成でエラーが発生しました",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  {"title": "リポジトリ", "value": "${{ github.repository }}", "short": true},
+                  {"title": "ワークフローログ", "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false}
+                ]
+              }]
+            }"
